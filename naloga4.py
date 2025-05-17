@@ -1,203 +1,207 @@
 import cv2 as cv
 import numpy as np
 
-# Global variables for the rectangle drawing
 drawing = False
 ix, iy = -1, -1
 rectangles = []
 
 
 def draw_rectangle(event, x, y, flags, param):
-    """Callback function to draw a rectangle on the image"""
-    global ix, iy, drawing, rectangles
-
+    global drawing, ix, iy, rectangles
     if event == cv.EVENT_LBUTTONDOWN:
         drawing = True
         ix, iy = x, y
-
-    elif event == cv.EVENT_MOUSEMOVE:
-        if drawing:
-            img_copy = param.copy()  # Copy the image to avoid drawing on the original
-            cv.rectangle(img_copy, (ix, iy), (x, y), (0, 255, 0), 2)
-            cv.imshow("Select ROI", img_copy)
-
+    elif event == cv.EVENT_MOUSEMOVE and drawing:
+        temp = param.copy()
+        cv.rectangle(temp, (ix, iy), (x, y), (0, 255, 0), 2)
+        cv.imshow("Select ROI", temp)
     elif event == cv.EVENT_LBUTTONUP:
         drawing = False
-        # Ensure correct coordinates after mouse release (handle cases when coordinates are inverted)
-        x0, y0 = ix, iy
-        x1, y1 = x, y
-        if x1 < x0:
-            x0, x1 = x1, x0
-        if y1 < y0:
-            y0, y1 = y1, y0
-        rectangles.append((x0, y0, x1 - x0, y1 - y0))  # Store the rectangle coordinates
+        x0, y0 = min(ix, x), min(iy, y)
+        x1, y1 = max(ix, x), max(iy, y)
+        rectangles.append((x0, y0, x1 - x0, y1 - y0))
         cv.rectangle(param, (x0, y0), (x1, y1), (0, 255, 0), 2)
         cv.imshow("Select ROI", param)
-        print(f"Selected ROI: {(x0, y0, x1 - x0, y1 - y0)}")
 
 
-def zaznaj_gibanje(cap, st_objektov=1):
-    """Funkcija za detekcijo gibanja, ki zazna premikajoče objekte"""
-    # Ustvarimo MOG2 objekt za odštevanje ozadja
-    fgbg = cv.createBackgroundSubtractorMOG2()
+def detect_motion(cap, count=3):
+    bg_sub = cv.createBackgroundSubtractorMOG2(
+        history=200, varThreshold=50, detectShadows=True
+    )
+    valid_detections = []
+    frame_out = None
 
-    detected_objects = 0  # Število zaznanih objektov
-    lokacije_oken = []  # Seznam vseh pravokotnikov (lokacij objektov)
-
-    while True:
-        # Preberi naslednji okvir
+    for _ in range(150):
         ret, frame = cap.read()
         if not ret:
-            print("No more frames to read.")
-            break  # Ko ni več okvirjev
+            break
+        fgmask = bg_sub.apply(frame)
+        fgmask[fgmask == 127] = 0
+        fgmask = cv.GaussianBlur(fgmask, (5, 5), 0)
+        _, fgmask = cv.threshold(fgmask, 200, 255, cv.THRESH_BINARY)
+        fgmask = cv.dilate(fgmask, None, iterations=2)
 
-        # Uporabi MOG2 za izračun gibanja
-        fgmask = fgbg.apply(frame)
-
-        # Poišči konture v maski
         contours, _ = cv.findContours(fgmask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
 
-        # Za vsako konturo, ki presega določen prag površine, narišemo pravokotnik
         for cnt in contours:
-            if cv.contourArea(cnt) > 500:  # Minimalna površina za zaznavanje objekta
-                x, y, w, h = cv.boundingRect(cnt)
-                lokacije_oken.append((x, y, w, h))
-                cv.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                detected_objects += 1
+            x, y, w, h = cv.boundingRect(cnt)
+            if cv.contourArea(cnt) < 800 or w < 10 or h < 10:
+                continue
 
-        # Prekini, ko dosežemo zahtevano število objektov
-        if detected_objects >= st_objektov:
-            print(f"Detected {detected_objects} objects.")
-            break  # Zaznali smo dovolj objektov, prekinemo iskanje
+            roi = hsv[y : y + h, x : x + w]
+            mask = cv.inRange(roi, (0, 40, 40), (180, 255, 255))
+            nonzero = cv.countNonZero(mask)
+            if nonzero < (w * h * 0.2):
+                continue
 
-        # Prikaz slike z detekcijami gibanja
-        cv.imshow("Motion Detected", frame)
-
-        # Pritisnite 'q' za prekinitev
-        if cv.waitKey(1) & 0xFF == ord("q"):
+            valid_detections.append((x, y, w, h))
+        if len(valid_detections) >= count:
+            frame_out = frame
             break
 
-    return lokacije_oken
+    return valid_detections[:count], frame_out
 
 
-def izracunaj_znacilnice(lokacije_oken, frame):
-    """Calculate object templates (histograms) for tracking."""
-    sablone = []
+def calculate_histograms(rects, frame):
     hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+    templates = []
+    for i, (x, y, w, h) in enumerate(rects):
+        pad_x = int(w * 0.3)
+        pad_y = int(h * 0.3)
+        roi = hsv[y + pad_y : y + h - pad_y, x + pad_x : x + w - pad_x]
 
-    # Debug: Show the first frame with rectangles for ROI selection
-    print("Calculating histograms for detected objects...")
+        # Check average saturation to choose histogram type
+        avg_saturation = np.mean(roi[:, :, 1])
+        if avg_saturation < 50:
+            use_1d = True
+        else:
+            use_1d = False
 
-    for x, y, w, h in lokacije_oken:
-        roi = hsv[y : y + h, x : x + w]
+        if use_1d:
+            mask = cv.inRange(roi, (0, 10, 10), (180, 255, 255))
+            hist = cv.calcHist([roi], [0], mask, [180], [0, 180])
+        else:
+            mask = cv.inRange(roi, (0, 20, 20), (180, 255, 255))
+            hist = cv.calcHist([roi], [0, 1], mask, [180, 256], [0, 180, 0, 256])
 
-        # Optional: Visualize the selected ROI
-        cv.rectangle(
-            frame, (x, y), (x + w, y + h), (255, 0, 0), 2
-        )  # Draw rectangle on the original image
-        cv.imwrite("Object.png", frame)
-        cv.waitKey(1)  # Display the image with the ROI for debugging purposes
-
-        # Calculate the histogram for the ROI
-        hist = cv.calcHist([roi], [0, 1], None, [256, 256], [0, 180, 0, 256])
-
-        # Normalize the histogram to ensure values are between 0 and 255
         cv.normalize(hist, hist, 0, 255, cv.NORM_MINMAX)
+        templates.append(hist)
 
-        # Append the histogram to the list of templates
-        sablone.append(hist)
+    return templates
 
-    return sablone
+
+def camshift(hsv, hist, window):
+    x, y, w, h = window
+    for _ in range(10):
+        backproj = cv.calcBackProject([hsv], [0, 1], hist, [0, 180, 0, 256], 1)
+        roi = backproj[y : y + h, x : x + w]
+        m = cv.moments(roi)
+        if m["m00"] < 1:
+            return window, False
+        cx = int(m["m10"] / m["m00"]) + x
+        cy = int(m["m01"] / m["m00"]) + y
+        new_x = max(0, min(hsv.shape[1] - w, cx - w // 2))
+        new_y = max(0, min(hsv.shape[0] - h, cy - h // 2))
+        if abs(new_x - x) < 2 and abs(new_y - y) < 2:
+            break
+        x, y = new_x, new_y
+
+    # refine size
+    roi = backproj[y : y + h, x : x + w]
+    proj_x = np.sum(roi, axis=0)
+    proj_y = np.sum(roi, axis=1)
+    w_new = np.count_nonzero(proj_x)
+    h_new = np.count_nonzero(proj_y)
+    if 10 < w_new < hsv.shape[1] and 10 < h_new < hsv.shape[0]:
+        w = int(0.8 * w + 0.2 * w_new)
+        h = int(0.8 * h + 0.2 * h_new)
+
+    return (x, y, w, h), True
 
 
 if __name__ == "__main__":
-    # Load video
-    cap = cv.VideoCapture(".videos/zaznaj_gibanje_nato_sledi.mp4")
+    cap = cv.VideoCapture(".videos/sledi_gibanju.mp4")
+    fourcc = cv.VideoWriter_fourcc(*"XVID")
+    fps = cap.get(cv.CAP_PROP_FPS)
+    width = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+    out = cv.VideoWriter("tracking_output.avi", fourcc, fps, (width, height))
 
-    if not cap.isOpened():
-        print("Error: Video not found or couldn't be loaded.")
-        exit(1)
-
-    # Set parameters for Camshift
-    iteracije = 10
-    napaka = 1
-
-    # Initialize rectangles (empty)
-    rectangles = []
-
-    # Read the first frame
-    ret, prva_slika = cap.read()
-
-    # Prompt to select motion detection or manual selection
-    zaznaj_gibanje_mode = "avtomatsko"  # Choose "rocno" for manual or "avtomatsko" for automatic motion detection
-
-    if zaznaj_gibanje_mode == "rocno":
-        # Display the frame and allow the user to select ROI manually
-        cv.imshow("Select ROI", prva_slika)
-        cv.setMouseCallback("Select ROI", draw_rectangle, param=prva_slika)
-
-        # Wait for the user to draw a rectangle and click on the window
-        print("Please select a region to track by dragging the mouse.")
-        while True:
-            key = cv.waitKey(1) & 0xFF
-            if key == ord("q"):  # Press 'q' to finish selection
-                break
-
-        # If no rectangle was drawn, exit
-        if not rectangles:
-            print("No object selected for tracking.")
-            exit(1)
-
-    elif zaznaj_gibanje_mode == "avtomatsko":
-        # Automatic motion detection
-        rectangles = zaznaj_gibanje(cap, st_objektov=3)
-
-    ret, detected_frame = cap.read()
+    ret, first_frame = cap.read()
     if not ret:
-        print("Error: No more frames to read.")
-        exit(1)
+        exit("Napaka: ne morem prebrati prve slike.")
 
-    # Calculate object templates for tracking using the frame where objects were detected
-    sablone = izracunaj_znacilnice(rectangles, detected_frame)
+    mode = "manual"  # "manual"
 
-    # Start tracking and showing the video
+    if mode == "manual":
+        cv.imshow("Select ROI", first_frame)
+        cv.setMouseCallback("Select ROI", draw_rectangle, first_frame)
+        print("Draw ROIs, press 'q' when done.")
+        while True:
+            if cv.waitKey(1) & 0xFF == ord("q"):
+                break
+        templates = calculate_histograms(rectangles, first_frame)
+    else:
+        rectangles, detection_frame = detect_motion(cap, 3)
+        if not rectangles:
+            exit("Napaka: ne najdem dovolj objektov.")
+        templates = calculate_histograms(rectangles, detection_frame)
+        for i, hist in enumerate(templates):
+            hist_img = cv.normalize(hist, None, 0, 255, cv.NORM_MINMAX)
+            hist_img = cv.resize(hist_img, (256, 180))  # resize for view
+            cv.imshow(f"Hist {i}", hist_img.astype(np.uint8))
+
+    cap.set(cv.CAP_PROP_POS_FRAMES, 0)
+
     while True:
-        ret, slika = cap.read()
+        ret, frame = cap.read()
         if not ret:
-            print("crkne")
-            break  # Break the loop if no more frames are available
+            break
+        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+        for i in range(len(rectangles)):
+            x, y, w, h = rectangles[i]
+            new_box, ok = camshift(hsv, templates[i], (x, y, w, h))
+            rectangles[i] = new_box
+            x, y, w, h = new_box
 
-        # Convert frame to HSV
-        hsv = cv.cvtColor(slika, cv.COLOR_BGR2HSV)
+            if ok:
+                cv.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv.putText(
+                    frame,
+                    f"Obj {i}",
+                    (x, y - 5),
+                    cv.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    1,
+                )
+            else:
+                cv.putText(
+                    frame,
+                    f"Obj {i} LOST",
+                    (x, y - 5),
+                    cv.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 255),
+                    1,
+                )
 
-        # Apply Camshift tracking for each selected object (or detected)
-        for rect in rectangles:
-            x, y, w, h = rect
-            roi = hsv[y : y + h, x : x + w]
-            hist = cv.calcHist([roi], [0, 1], None, [256, 256], [0, 180, 0, 256])
-            cv.normalize(hist, hist, 0, 255, cv.NORM_MINMAX)
-            backproj = cv.calcBackProject([hsv], [0, 1], hist, [0, 180, 0, 256], 1)
-
-            # Apply Camshift to find the new location of the object
-            ret, track_window = cv.CamShift(
-                backproj,
-                (x, y, w, h),
-                (cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, iteracije, napaka),
+            # Debug backproj view
+            backproj = cv.calcBackProject(
+                [hsv], [0, 1], templates[i], [0, 180, 0, 256], 1
             )
+            debug_roi = backproj[y : y + h, x : x + w]
+            color_map = cv.applyColorMap(debug_roi, cv.COLORMAP_JET)
+            if color_map.shape[0] > 0 and color_map.shape[1] > 0:
+                resized = cv.resize(color_map, (60, 60))
+                frame[10 + i * 65 : 70 + i * 65, 10:70] = resized
 
-            # Draw the tracked object
-            pts = cv.boxPoints(ret)
-            pts = np.int32(pts)  # Convert to int32
-            cv.polylines(slika, [pts], True, (0, 255, 0), 2)
-
-        # Display the result in the window
-        cv.imshow("Tracking Result", slika)
-
-        # Check for keypress (wait indefinitely for keypress)
-        key = cv.waitKey(1)  # Wait for 1 millisecond and capture key press
-        if key == ord("q"):  # If 'q' is pressed, break the loop
+        cv.imshow("Tracking", frame)
+        out.write(frame)
+        if cv.waitKey(10) & 0xFF == ord("q"):
             break
 
-    # Release the capture and close the window when done
     cap.release()
+    out.release()
     cv.destroyAllWindows()
