@@ -1,12 +1,17 @@
 import cv2 as cv
 import numpy as np
 
+# Global variables for manual ROI selection
 drawing = False
 ix, iy = -1, -1
 rectangles = []
 
 
 def draw_rectangle(event, x, y, flags, param):
+    """
+    Mouse callback to allow manual selection of objects in the video.
+    Saves the rectangle coordinates into `rectangles`.
+    """
     global drawing, ix, iy, rectangles
     if event == cv.EVENT_LBUTTONDOWN:
         drawing = True
@@ -24,26 +29,50 @@ def draw_rectangle(event, x, y, flags, param):
         cv.imshow("Select ROI", param)
 
 
-def detect_motion(cap, count=3):
+def zaznaj_gibanje(cap, objekti=3):
+    """
+    Detects motion using background subtraction and extracts bounding boxes
+    around moving objects. Waits until 3 strong detections appear consistently.
+    """
+
+    def je_nov_bbox(x, y, w, h, boxes, min_dist=30):
+        """Check if a bounding box is far enough from previous ones (to avoid duplicates)."""
+        cx, cy = x + w // 2, y + h // 2
+        for px, py, pw, ph in boxes:
+            pcx, pcy = px + pw // 2, py + ph // 2
+            if np.hypot(cx - pcx, cy - pcy) < min_dist:
+                return False
+        return True
+
+    def hist_strength(x, y, w, h, hsv):
+        """Returns the strength of color distribution inside the box (used for ranking)."""
+        roi = hsv[y : y + h, x : x + w]
+        mask = cv.inRange(roi, (0, 40, 40), (180, 255, 255))
+        hist = cv.calcHist([roi], [0, 1], mask, [180, 256], [0, 180, 0, 256])
+        return cv.norm(hist)
+
     fgbg = cv.createBackgroundSubtractorMOG2(
         history=150, varThreshold=60, detectShadows=True
     )
-    detections = []
     frame_out = None
+    lokacija_ok_count = 0
+    best_boxes = []
 
     for _ in range(150):
         ret, frame = cap.read()
         if not ret:
             break
+
         fgmask = fgbg.apply(frame)
         fgmask[fgmask == 127] = 0  # remove shadow mask
         fgmask = cv.GaussianBlur(fgmask, (5, 5), 0)
         _, fgmask = cv.threshold(fgmask, 200, 255, cv.THRESH_BINARY)
         fgmask = cv.dilate(fgmask, None, iterations=2)
 
-        contours, _ = cv.findContours(fgmask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
         hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+        contours, _ = cv.findContours(fgmask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
 
+        detections = []
         for cnt in contours:
             x, y, w, h = cv.boundingRect(cnt)
             if cv.contourArea(cnt) < 800 or w < 10 or h < 10:
@@ -53,75 +82,90 @@ def detect_motion(cap, count=3):
             mean_s = np.mean(roi[:, :, 1])
             mean_v = np.mean(roi[:, :, 2])
             if mean_s < 15 or mean_v < 15:
-                continue  # too gray or too dark
+                continue  # skip gray/dark boxes
 
-            detections.append((x, y, w, h))
+            if je_nov_bbox(x, y, w, h, detections):
+                detections.append((x, y, w, h))
 
-        if len(detections) >= count:
-            frame_out = frame
-            break
+        if len(detections) >= objekti:
+            detections.sort(key=lambda box: hist_strength(*box, hsv), reverse=True)
+            best_boxes = detections[:objekti]
+            lokacija_ok_count += 1
+            if lokacija_ok_count >= 3:
+                frame_out = frame
+                break
 
-    return detections[:count], frame_out
+    return best_boxes, frame_out
 
 
-def calculate_histograms(rects, frame):
+def izracunaj_znacilnice(lokacije_oken, frame):
+    """
+    Extracts color histograms (templates) for each bounding box.
+    These are later used to track objects via histogram backprojection.
+    """
     hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-    templates = []
+    sablone = []
 
-    for x, y, w, h in rects:
-        pad_x = int(w * 0.2)
-        pad_y = int(h * 0.2)
+    for x, y, w, h in lokacije_oken:
+        pad_x = int(w * 0.16)
+        pad_y = int(h * 0.16)
         roi = hsv[y + pad_y : y + h - pad_y, x + pad_x : x + w - pad_x]
 
-        mean_s = np.mean(roi[:, :, 1])
-
-        if mean_s < 40:
-            mask = cv.inRange(roi, (0, 10, 10), (180, 255, 255))
-            hist = cv.calcHist([roi], [0], mask, [180], [0, 180])
-        else:
-            mask = cv.inRange(roi, (0, 30, 30), (180, 255, 255))
-            hist = cv.calcHist([roi], [0, 1], mask, [180, 256], [0, 180, 0, 256])
-
+        # Use a 1D histogram on hue for general robustness
+        mask = cv.inRange(roi, (0, 10, 10), (180, 255, 255))
+        hist = cv.calcHist([roi], [0], mask, [180], [0, 180])
         cv.normalize(hist, hist, 0, 255, cv.NORM_MINMAX)
-        templates.append(hist)
+        sablone.append(hist)
 
-    return templates
+    return sablone
 
 
-def camshift(hsv, hist, window):
-    x, y, w, h = window
-    for _ in range(10):
-        if len(hist.shape) == 2:  # 2D histogram
-            backproj = cv.calcBackProject([hsv], [0, 1], hist, [0, 180, 0, 256], 1)
-        else:  # 1D hue only
-            backproj = cv.calcBackProject([hsv], [0], hist, [0, 180], 1)
+def camshift(slika, sablona, lokacija_okna, iteracije=10, napaka=1):
+    """
+    A simplified CamShift implementation using histogram backprojection.
+    It shifts the search window to the centroid of the object based on histogram response.
+    """
+    hsv = cv.cvtColor(slika, cv.COLOR_BGR2HSV)
+    x, y, w, h = lokacija_okna
+
+    for _ in range(iteracije):
+        if len(sablona.shape) == 2:
+            backproj = cv.calcBackProject([hsv], [0, 1], sablona, [0, 180, 0, 256], 1)
+        else:
+            backproj = cv.calcBackProject([hsv], [0], sablona, [0, 180], 1)
 
         roi = backproj[y : y + h, x : x + w]
         m = cv.moments(roi)
+
         if m["m00"] < 1:
-            return window, False
+            return lokacija_okna, False  # Object likely lost
 
         cx = int(m["m10"] / m["m00"]) + x
         cy = int(m["m01"] / m["m00"]) + y
-        new_x = max(0, min(hsv.shape[1] - w, cx - w // 2))
-        new_y = max(0, min(hsv.shape[0] - h, cy - h // 2))
-        if abs(new_x - x) < 2 and abs(new_y - y) < 2:
+        new_x = max(0, min(slika.shape[1] - w, cx - w // 2))
+        new_y = max(0, min(slika.shape[0] - h, cy - h // 2))
+
+        if abs(new_x - x) < napaka and abs(new_y - y) < napaka:
             break
+
         x, y = new_x, new_y
 
     return (x, y, w, h), True
 
 
+# ========================= MAIN =========================
+
 if __name__ == "__main__":
-    cap = cv.VideoCapture(".videos/zaznaj_gibanje_nato_sledi.mp4")
+    # cap = cv.VideoCapture(".videos/zaznaj_gibanje_nato_sledi.mp4")
+    cap = cv.VideoCapture(".videos/sledi_gibanju.mp4")
     if not cap.isOpened():
         exit("Napaka: video ni naložen.")
 
-    ret, first = cap.read()
+    ret, first_frame = cap.read()
     if not ret:
         exit("Napaka: ne morem prebrati prve slike.")
 
-    mode = "auto"
+    # Prepare video output
     fourcc = cv.VideoWriter_fourcc(*"XVID")
     out = cv.VideoWriter(
         "tracking_output.avi",
@@ -130,19 +174,21 @@ if __name__ == "__main__":
         (int(cap.get(cv.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))),
     )
 
-    if mode == "manual":
-        cv.imshow("Select ROI", first)
-        cv.setMouseCallback("Select ROI", draw_rectangle, first)
-        print("Izberi ROIs, pritisni 'q' ko končaš.")
+    zaznaj_mode = "auto"  # can also be "manual"
+
+    if zaznaj_mode == "manual":
+        cv.imshow("Select ROI", first_frame)
+        cv.setMouseCallback("Select ROI", draw_rectangle, first_frame)
+        print("Izberi ROIs z miško. Pritisni 'q', ko končaš.")
         while True:
             if cv.waitKey(1) & 0xFF == ord("q"):
                 break
-        templates = calculate_histograms(rectangles, first)
+        sablone = izracunaj_znacilnice(rectangles, first_frame)
     else:
-        rectangles, snapshot = detect_motion(cap, count=3)
+        rectangles, snapshot = zaznaj_gibanje(cap, objekti=3)
         if not rectangles:
             exit("Napaka: objekti niso zaznani.")
-        templates = calculate_histograms(rectangles, snapshot)
+        sablone = izracunaj_znacilnice(rectangles, snapshot)
 
     cap.set(cv.CAP_PROP_POS_FRAMES, 0)
 
@@ -150,10 +196,10 @@ if __name__ == "__main__":
         ret, frame = cap.read()
         if not ret:
             break
-        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+
         for i in range(len(rectangles)):
             x, y, w, h = rectangles[i]
-            new_box, ok = camshift(hsv, templates[i], (x, y, w, h))
+            new_box, ok = camshift(frame, sablone[i], (x, y, w, h))
             rectangles[i] = new_box
             x, y, w, h = new_box
 
